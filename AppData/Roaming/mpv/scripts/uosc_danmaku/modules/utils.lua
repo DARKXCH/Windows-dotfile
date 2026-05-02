@@ -1,4 +1,5 @@
 local utils = require("mp.utils")
+local unpack = unpack or table.unpack
 
 -- from http://lua-users.org/wiki/LuaUnicode
 local UTF8_PATTERN = '[%z\1-\127\194-\244][\128-\191]*'
@@ -9,17 +10,37 @@ function utf8_sub(s, i, j)
     if i > j then
         return s
     end
-
-    local t = {}
-    local idx = 1
+    local t, idx = {}, 1
     for char in s:gmatch(UTF8_PATTERN) do
-        if i <= idx and idx <= j then
-            local width = #char > 2 and 2 or 1
-            idx = idx + width
+        if idx >= i and idx <= j then
             t[#t + 1] = char
         end
+        idx = idx + 1
     end
     return table.concat(t)
+end
+
+function utf8_len(s)
+    local count = 0
+    for _ in s:gmatch(UTF8_PATTERN) do
+        count = count + 1
+    end
+    return count
+end
+
+function utf8_iter(s)
+    local iter = s:gmatch(UTF8_PATTERN)
+    return function()
+        return iter()
+    end
+end
+
+function utf8_to_table(s)
+    local t = {}
+    for ch in utf8_iter(s) do
+        t[#t + 1] = ch
+    end
+    return t
 end
 
 -- abbreviate string if it's too long
@@ -89,6 +110,74 @@ function unicode_to_utf8(unicode)
     end
 end
 
+function jaro(s1, s2)
+    local match_window = math.floor(math.max(#s1, #s2) / 2.0) - 1
+    local matches1 = {}
+    local matches2 = {}
+
+    local m = 0;
+    local t = 0;
+
+    for i = 0, #s1, 1 do
+        local start = math.max(0, i - match_window)
+        local final = math.min(i + match_window + 1, #s2)
+
+        for k = start, final, 1 do
+            if not (matches2[k] or s1[i] ~= s2[k]) then
+                matches1[i] = true
+                matches2[k] = true
+                m = m + 1
+                break
+            end
+        end
+    end
+
+    if m == 0 then
+        return 0.0
+    end
+
+    local k = 0
+    for i = 0, #s1, 1 do
+        if matches1[i] then
+            while not matches2[k] do
+                k = k + 1
+            end
+
+            if s1[i] ~= s2[k] then
+                t = t + 1
+            end
+
+            k = k + 1
+        end
+    end
+
+    t = t / 2.0
+
+    return (m / #s1 + m / #s2 + (m - t) / m) / 3.0
+end
+
+function jaro_winkler(s1, s2)
+    if #s1 + #s2 == 0 then
+        return 0.0
+    end
+
+    if s1 == s2 then
+        return 1.0
+    end
+
+    s1 = utf8_to_table(s1)
+    s2 = utf8_to_table(s2)
+
+    local d = jaro(s1, s2)
+    local p = 0.1
+    local l = 0;
+    while (s1[l] == s2[l] and l < 4) do
+        l = l + 1
+    end
+
+    return d + l * p * (1 - d)
+end
+
 -- 从时间字符串转换为秒数
 function time_to_seconds(time_str)
     local h, m, s = time_str:match("(%d+):(%d+):([%d%.]+)")
@@ -120,6 +209,31 @@ end
 
 function hex_to_char(x)
     return string.char(tonumber(x, 16))
+end
+
+function hex_to_int_color(hex_color)
+    -- 移除颜色代码中的'#'字符
+    hex_color = hex_color:sub(2)  -- 只保留颜色代码部分
+
+    -- 提取R, G, B的十六进制值并转为整数
+    local r = tonumber(hex_color:sub(1, 2), 16)
+    local g = tonumber(hex_color:sub(3, 4), 16)
+    local b = tonumber(hex_color:sub(5, 6), 16)
+
+    -- 计算32位整数值
+    local color_int = (r * 256 * 256) + (g * 256) + b
+
+    return color_int
+end
+
+function color_dist(c1, c2)
+    local r1 = math.floor(c1 / 65536) % 256
+    local g1 = math.floor(c1 / 256) % 256
+    local b1 = c1 % 256
+    local r2 = math.floor(c2 / 65536) % 256
+    local g2 = math.floor(c2 / 256) % 256
+    local b2 = c2 % 256
+    return math.sqrt((r1-r2)^2 + (g1-g2)^2 + (b1-b2)^2)
 end
 
 -- url编码转换
@@ -230,6 +344,67 @@ function file_exists(path)
     return false
 end
 
+function binary_search(tbl, target, key)
+    if not tbl or #tbl == 0 then return 1 end
+    key = key or function(x) return x end
+    local lo, hi = 1, #tbl
+    local res = #tbl + 1
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        local v = tbl[mid]
+        local val = key(v)
+        if val >= target then
+            res = mid
+            hi = mid - 1
+        else
+            lo = mid + 1
+        end
+    end
+    return res
+end
+
+function new_min_heap()
+    local h = {}
+    local function swap(i, j)
+        h[i], h[j] = h[j], h[i]
+    end
+    local function up(i)
+        while i > 1 do
+            local p = math.floor(i/2)
+            if h[p].time <= h[i].time then break end
+            swap(p, i)
+            i = p
+        end
+    end
+    local function down(i)
+        local n = #h
+        while true do
+            local l = i * 2
+            local r = l + 1
+            local smallest = i
+            if l <= n and h[l].time < h[smallest].time then smallest = l end
+            if r <= n and h[r].time < h[smallest].time then smallest = r end
+            if smallest == i then break end
+            swap(i, smallest)
+            i = smallest
+        end
+    end
+    local function push(node)
+        h[#h + 1] = node
+        up(#h)
+    end
+    local function pop()
+        if #h == 0 then return nil end
+        local root = h[1]
+        if #h == 1 then h[1] = nil; return root end
+        h[1] = h[#h]
+        h[#h] = nil
+        down(1)
+        return root
+    end
+    return { push = push, pop = pop, size = function() return #h end }
+end
+
 function is_writable(path)
     local file = io.open(path, "w")
     if file then
@@ -247,6 +422,42 @@ function contains_any(tab, val)
         end
     end
     return false
+end
+
+-- 将一个逗号分隔的 api_server 字符串解析为有序列表
+function get_api_server_list(api_server_str, meta)
+    local want_meta = meta or false
+    local metas = {}
+    if not api_server_str or api_server_str == "" then
+        if want_meta then return metas end
+        return {}
+    end
+
+    for part in string.gmatch(api_server_str, "[^,]+") do
+        local s = part:gsub('^%s*(.-)%s*$', '%1')
+        if s ~= '' then
+            local u, n = s:match('^(.-)[|#](.*)$')
+            local url = nil
+            local note = nil
+            if u then
+                url = u:gsub('^%s*(.-)%s*$', '%1')
+                note = n and n:gsub('^%s*(.-)%s*$', '%1') or nil
+            else
+                url = s:gsub('^%s*(.-)%s*$', '%1')
+                note = nil
+            end
+            table.insert(metas, { url = url, note = note })
+        end
+    end
+
+    if #metas == 0 and api_server_str ~= '' then
+        table.insert(metas, { url = api_server_str, note = nil })
+    end
+
+    if want_meta then return metas end
+    local urls = {}
+    for _, m in ipairs(metas) do table.insert(urls, m.url) end
+    return urls
 end
 
 --读history 和 写history
@@ -297,11 +508,20 @@ local function split_by_numbers(filename)
     end
     return parts
 end
- 
--- 识别并匹配前后剧集
-local function compare_filenames(fname1, fname2)
+
+-- 识别匹配前后剧集并提取集数
+local function get_series_episodes(fname1, fname2)
     local parts1 = split_by_numbers(fname1)
     local parts2 = split_by_numbers(fname2)
+    local title1 = format_filename(fname1)
+    local title2 = format_filename(fname2)
+    if title1 and title2 then
+        local media_title1, season1, episode1 = title1:match("^(.-)%s*[sS](%d+)[eE](%d+)")
+        local media_title2, season2, episode2 = title2:match("^(.-)%s*[sS](%d+)[eE](%d+)")
+        if season1 and season2 and season1 ~= season2 then
+            return nil, nil
+        end
+    end
 
     local min_len = math.min(#parts1, #parts2)
 
@@ -312,7 +532,7 @@ local function compare_filenames(fname1, fname2)
 
         -- 比较数字前的字符是否相同
         if part1.pre ~= part2.pre then
-            return false
+            return nil, nil
         end
 
         -- 比较数字部分
@@ -322,11 +542,36 @@ local function compare_filenames(fname1, fname2)
 
         -- 比较数字后的字符是否相同
         if part1.post ~= part2.post then
-            return false
+            return nil, nil
         end
     end
 
-    return false
+    return nil, nil
+end
+
+-- 获取当前文件名所包含的集数
+function get_episode_number(filename, fname)
+    -- 尝试对比记录文件名来获取当前集数
+    if fname then
+        return get_series_episodes(fname, filename)
+    end
+
+    local thin_space = string.char(0xE2, 0x80, 0x89)
+    filename = filename:gsub(thin_space, " ")
+
+    local title = format_filename(filename)
+    if title then
+        local media_title, season, episode = title:match("^(.-)%s*[sS](%d+)[eE](%d+)")
+        if season then
+            return tonumber(episode)
+        else
+            local media_title, episode = title:match("^(.-)%s*[eE](%d+)")
+            if episode then
+                return tonumber(episode)
+            end
+        end
+    end
+    return nil
 end
 
 -- 规范化路径
@@ -374,14 +619,15 @@ function parse_title()
     end
     local thin_space = string.char(0xE2, 0x80, 0x89)
     filename = filename:gsub(thin_space, " ")
+    local media_title, season, episode = nil, nil, nil
     if path and not is_protocol(path) then
         local title = format_filename(filename)
         if title then
-            local media_title, season, episode = title:match("^(.-)%s*[sS](%d+)[eE](%d+)")
+            media_title, season, episode = title:match("^(.-)%s*[sS](%d+)[eE](%d+)")
             if season then
                 return title_replace(media_title), season, episode
             else
-                local media_title, episode = title:match("^(.-)%s*[eE](%d+)")
+                media_title, episode = title:match("^(.-)%s*[eE](%d+)")
                 if episode then
                     return title_replace(media_title), season, episode
                 end
@@ -406,7 +652,6 @@ function parse_title()
     end
 
     local title = mp.get_property("media-title")
-    local media_title, season, episode = nil, nil, nil
     if title then
         title = title:gsub(thin_space, " ")
         local ftitle = url_decode(title)
@@ -432,50 +677,130 @@ function parse_title()
     return title_replace(title), season, episode
 end
 
--- 获取当前文件名所包含的集数
-function get_episode_number(filename, fname)
-    -- 尝试对比记录文件名来获取当前集数
-    if fname then
-        local episode_num1, episode_num2 = compare_filenames(fname, filename)
-        if episode_num1 and episode_num2 then
-            return episode_num1, episode_num2
-        else
-            return nil, nil
-        end
+local CHINESE_NUM_MAP = {
+    ["零"] = 0, ["一"] = 1, ["二"] = 2, ["三"] = 3, ["四"] = 4,
+    ["五"] = 5, ["六"] = 6, ["七"] = 7, ["八"] = 8, ["九"] = 9,
+    ["十"] = 10, ["百"] = 100, ["千"] = 1000, ["万"] = 10000,
+}
+
+function chinese_to_number(cn)
+    local total = 0
+    local num = 0
+    local unit = 1
+
+    local chars = {}
+    for uchar in cn:gmatch(UTF8_PATTERN) do
+        table.insert(chars, 1, uchar)
     end
 
-    local thin_space = string.char(0xE2, 0x80, 0x89)
-    filename = filename:gsub(thin_space, " ")
-
-    local title = format_filename(filename)
-    if title then
-        local media_title, season, episode = title:match("^(.-)%s*[sS](%d+)[eE](%d+)")
-        if season then
-            return tonumber(episode)
-        else
-            local media_title, episode = title:match("^(.-)%s*[eE](%d+)")
-            if episode then
-                return tonumber(episode)
+    for _, char in ipairs(chars) do
+        local val = CHINESE_NUM_MAP[char]
+        if val then
+            if val >= 10 then
+                if num == 0 then
+                    num = 1
+                end
+                unit = val
+            else
+                total = total + val * unit
+                unit = 1
+                num = 0
             end
         end
     end
-    return nil
+
+    if unit > 1 then
+        total = total + num * unit
+    end
+
+    if total > 0 then
+        return total
+    else
+        return num
+    end
+end
+
+local CHINESE_NUM = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"}
+local CHINESE_UNIT = {"", "十", "百", "千"}
+local CHINESE_BIG_UNIT = {"", "万", "亿"}
+
+function number_to_chinese(num)
+    if num == 0 then return "零" end
+
+    local str = tostring(num)
+    local len = #str
+    local result = ""
+    local zero_flag = false
+
+    for i = 1, len do
+        local digit = tonumber(str:sub(i, i))
+        local pos = len - i + 1
+        local small_unit_index = (pos - 1) % 4 + 1
+        local small_unit = CHINESE_UNIT[small_unit_index]
+
+        if digit == 0 then
+            zero_flag = true
+        else
+            if zero_flag then
+                result = result .. "零"
+                zero_flag = false
+            end
+            if digit == 1 and small_unit_index == 2 and i == 1 then
+                result = result .. small_unit
+            else
+                result = result .. CHINESE_NUM[digit + 1] .. small_unit
+            end
+        end
+
+        if pos % 4 == 1 and pos > 1 then
+            local big_unit_index = math.floor((pos - 1) / 4)
+            result = result .. CHINESE_BIG_UNIT[big_unit_index + 1]
+        end
+    end
+
+    result = result:gsub("零+$", "")
+
+    return result
+end
+
+-- 内部的异步运行计数
+local async_running_count = 0
+
+function mark_async_start()
+    async_running_count = async_running_count + 1
+end
+
+function mark_async_end()
+    if async_running_count > 0 then
+        async_running_count = async_running_count - 1
+    end
+end
+
+function is_async_running()
+    return async_running_count > 0
 end
 
 -- 异步执行命令
 -- 同时返回 abort 函数，用于取消异步命令
 function call_cmd_async(args, callback)
-    async_running = true
+    -- 标记异步开始
+    mark_async_start()
+
     local abort_signal = mp.command_native_async({
         name = 'subprocess',
         capture_stderr = true,
         capture_stdout = true,
-        playback_only = false,
+        playback_only = true,
         args = args,
     }, function(success, result, error)
+        -- 标记异步结束
+        mark_async_end()
+
         if not success or not result or result.status ~= 0 then
             local exit_code = (result and result.status or 'unknown')
-            local message = error or (result and result.stdout .. result.stderr) or ''
+            local message = error or (
+                result and ((result.stdout or '') .. (result.stderr or ''))
+            ) or ''
             callback('Calling failed. Exit code: ' .. exit_code .. ' Error: ' .. message, {})
             return
         end
@@ -486,5 +811,167 @@ function call_cmd_async(args, callback)
 
     return function()
         mp.abort_async_command(abort_signal)
+    end
+end
+
+local function yield_once()
+    local co = coroutine.running()
+    mp.add_timeout(0, function()
+        coroutine.resume(co)
+    end)
+    coroutine.yield()
+end
+
+local function make_safe_resume(co, timer_ref)
+    local resumed = false
+
+    return function(...)
+        if resumed then return end
+        resumed = true
+
+        if timer_ref.timer then
+            timer_ref.timer:kill()
+            timer_ref.timer = nil
+        end
+
+        local ok, err = coroutine.resume(co, ...)
+        if not ok then
+            mp.msg.warn("resume failed: " .. tostring(err))
+        end
+    end
+end
+
+function await_call_cmd(args, timeout, on_start)
+    local co = coroutine.running()
+
+    local timer_ref = { timer = nil }
+    local safe_resume = make_safe_resume(co, timer_ref)
+
+    local abort_fn = call_cmd_async(args, function(err, out)
+        safe_resume(err, out)
+    end)
+
+    if on_start and type(on_start) == 'function' then
+        pcall(on_start, abort_fn)
+    end
+
+    if timeout and type(timeout) == 'number' and timeout > 0 then
+        timer_ref.timer = mp.add_timeout(timeout, function()
+            if abort_fn then pcall(abort_fn) end
+            safe_resume("timeout", nil)
+        end)
+    end
+
+    return coroutine.yield()
+end
+
+-- 并行请求调度器
+-- servers: { "url1", "url2", ... }
+-- build_args_fn(server) -> args
+-- per_response_cb(server, err, stdout)
+-- final_cb() 可选
+-- opts: { concurrency=3, per_request_timeout=10 }
+function parallel_requests(servers, build_args_fn, per_response_cb, final_cb, opts)
+    if type(final_cb) == 'table' and opts == nil then
+        opts = final_cb
+        final_cb = nil
+    end
+
+    opts = opts or {}
+    local concurrency = opts.concurrency or 3
+    local timeout = opts.per_request_timeout or 10
+
+    local in_flight_abort = {}
+    local in_flight_count = 0
+    local aborted = false
+    local idx = 1
+    local monitor = nil
+
+    -- worker 协程
+    local function worker()
+        while true do
+            if aborted then return end
+
+            local i = idx
+            if i > #servers then return end
+            idx = idx + 1
+
+            local server = servers[i]
+            local args = build_args_fn(server)
+
+            if not args then
+                if not aborted then
+                    pcall(per_response_cb, server, "no_args", nil)
+                end
+
+                yield_once()
+            else
+                local ok, err, out = pcall(function()
+                    return await_call_cmd(args, timeout, function(ab)
+                        in_flight_abort[i] = ab
+                        in_flight_count = in_flight_count + 1
+                    end)
+                end)
+
+                -- 请求结束
+                if in_flight_abort[i] then
+                    in_flight_abort[i] = nil
+                    in_flight_count = in_flight_count - 1
+                end
+
+                if aborted then return end
+
+                if not ok then
+                    pcall(per_response_cb, server, tostring(err), nil)
+                else
+                    pcall(per_response_cb, server, err, out)
+                end
+            end
+        end
+    end
+
+    -- 启动 worker
+    local workers = {}
+    for i = 1, math.min(concurrency, #servers) do
+        local co = coroutine.create(worker)
+        local ok, res = coroutine.resume(co)
+        if not ok then
+            mp.msg.warn("worker start failed: " .. tostring(res))
+        end
+        workers[#workers + 1] = co
+    end
+
+    -- monitor（完成检测）
+    monitor = mp.add_periodic_timer(0.05, function()
+        if aborted then
+            monitor:kill()
+            return
+        end
+
+        local all_assigned = (idx > #servers)
+        local any_inflight = (in_flight_count > 0)
+
+        if all_assigned and not any_inflight then
+            monitor:kill()
+            if final_cb then pcall(final_cb) end
+        end
+    end)
+
+    -- 返回取消函数
+    return function()
+        if aborted then return end
+        aborted = true
+
+        for i, abort_fn in pairs(in_flight_abort) do
+            if abort_fn then pcall(abort_fn) end
+            in_flight_abort[i] = nil
+        end
+
+        in_flight_count = 0
+
+        if monitor then
+            monitor:kill()
+            monitor = nil
+        end
     end
 end

@@ -1,4 +1,4 @@
-VERSION = "2.0.0"
+VERSION = "2.2.0"
 
 mp.commandv('script-message', 'uosc_danmaku-version', VERSION)
 
@@ -25,11 +25,13 @@ DANMAKU_PATH = os.getenv("TEMP") or "/tmp/"
 HISTORY_PATH = mp.command_native({"expand-path", options.history_path})
 PID = utils.getpid()
 DANMAKU = {sources = {}, count = 1}
-DELAYS = {}
 ENABLED, COMMENTS, DELAY = false, nil, 0
 DELAY_PROPERTY = string.format("user-data/%s/danmaku-delay", mp.get_script_name())
 mp.set_property_native(DELAY_PROPERTY, 0)
-
+HAS_DANMAKU = string.format("user-data/%s/has-danmaku", mp.get_script_name())
+mp.set_property_bool(HAS_DANMAKU, false)
+DANMAKU_SWITCH_ON = string.format("user-data/%s/danmaku-switch-on", mp.get_script_name())
+mp.set_property_bool(DANMAKU_SWITCH_ON, false)
 KEY = table_to_zero_indexed({
     0x00,0x01,0x02,0x03,0x04,
     0x05,0x06,0x07,0x08,0x09,
@@ -57,6 +59,8 @@ PLATFORM = (function()
     end
     return "linux"
 end)()
+
+local rebuild_convert_timer = nil
 
 function get_danmaku_visibility()
     local history_json = read_file(HISTORY_PATH)
@@ -90,7 +94,7 @@ end
 
 function set_danmaku_button()
     if get_danmaku_visibility() then
-        mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "on")
+        toggle_danmaku_switch("on")
     end
 end
 
@@ -140,21 +144,6 @@ local function extract_between_colons(input_string)
     end
 end
 
-local function hex_to_int_color(hex_color)
-    -- 移除颜色代码中的'#'字符
-    hex_color = hex_color:sub(2)  -- 只保留颜色代码部分
-
-    -- 提取R, G, B的十六进制值并转为整数
-    local r = tonumber(hex_color:sub(1, 2), 16)
-    local g = tonumber(hex_color:sub(3, 4), 16)
-    local b = tonumber(hex_color:sub(5, 6), 16)
-
-    -- 计算32位整数值
-    local color_int = (r * 256 * 256) + (g * 256) + b
-
-    return color_int
-end
-
 local function get_type_from_position(position)
     if position == 0 then
         return 1
@@ -170,11 +159,13 @@ end
 function get_delay_for_time(delay_segments, time)
     if not delay_segments or #delay_segments == 0 then return 0 end
 
-    table.sort(delay_segments, function(a, b) return a.start < b.start end)
+    local segs = {}
+    for i = 1, #delay_segments do segs[i] = delay_segments[i] end
+    table.sort(segs, function(a, b) return a.start < b.start end)
 
     local applied_delay = 0
-    for i = 1, #delay_segments do
-        local seg = delay_segments[i]
+    for i = 1, #segs do
+        local seg = segs[i]
         local delay = tonumber(seg.delay)
         if time >= seg.start and delay then
             applied_delay = applied_delay + delay
@@ -244,9 +235,29 @@ local function merge_delay_segments(segments)
     return merged
 end
 
-local function set_danmaku_delay(dly, time)
-    for url, source in pairs(DANMAKU.sources) do
-        if source.fname and not source.blocked then
+function parse_delay_input(text)
+    if not text then return nil end
+    local s = tostring(text):gsub("%s+", "")
+    if s == "" then return nil end
+    -- XmYs 格式，允许负号在分钟部分
+    local m, sec = string.match(s, "^(%-?%d+)m(%d+)s$")
+    if m and sec then
+        m = tonumber(m)
+        sec = tonumber(sec)
+        if not m or not sec then return nil end
+        if m < 0 then sec = -sec end
+        return m * 60 + sec
+    end
+    -- 普通数字（整数或小数），支持负数
+    local n = tonumber(s)
+    if n ~= nil then return n end
+    return nil
+end
+
+local function set_danmaku_delay(dly, time, specific_source)
+    if specific_source then
+        local source = DANMAKU.sources[specific_source]
+        if source and source.data and not source.blocked then
             source.delay_segments = source.delay_segments or {}
             if dly == 0 then
                 source.delay_segments = {}
@@ -255,31 +266,51 @@ local function set_danmaku_delay(dly, time)
             else
                 table.insert(source.delay_segments, {start = 0, delay = dly})
             end
-
             source.delay = nil
-            table.sort(source.delay_segments, function(a, b) return a.start < b.start end)
-            add_source_to_history(url, source)
+            source.delay_segments = merge_delay_segments(source.delay_segments)
+            add_source_to_history(specific_source, source)
         end
-    end
-
-    if time then
-        table.insert(DELAYS, {start = time, delay = dly})
     else
-        table.insert(DELAYS, {start = 0, delay = dly})
+        for url, source in pairs(DANMAKU.sources) do
+            if source.data and not source.blocked then
+                source.delay_segments = source.delay_segments or {}
+                if dly == 0 then
+                    source.delay_segments = {}
+                elseif time then
+                    table.insert(source.delay_segments, {start = time, delay = dly})
+                else
+                    table.insert(source.delay_segments, {start = 0, delay = dly})
+                end
+
+                source.delay = nil
+                source.delay_segments = merge_delay_segments(source.delay_segments)
+                add_source_to_history(url, source)
+            end
+        end
     end
 
     if dly == 0 then
         DELAY = 0
-        DELAYS = {}
     else
         DELAY = DELAY + dly
     end
 
-    DELAYS = merge_delay_segments(DELAYS)
-
     if ENABLED and COMMENTS ~= nil then
         render()
     end
+
+    -- 防抖：批量重建 ASS 事件并渲染，避免频繁变更导致重复重建
+    if rebuild_convert_timer then
+        rebuild_convert_timer:kill()
+        rebuild_convert_timer = nil
+    end
+    rebuild_convert_timer = mp.add_timeout(0.1, function()
+        if convert_danmaku_to_ass_events then
+            convert_danmaku_to_ass_events(true)
+        end
+        render()
+        rebuild_convert_timer = nil
+    end)
 
     show_message('设置弹幕延迟: ' .. string.format("%.1f", DELAY + 1e-10) .. ' s')
     mp.set_property_native(DELAY_PROPERTY, DELAY)
@@ -299,9 +330,6 @@ local function clear_source()
 
     for url, source in pairs(DANMAKU.sources) do
         if source.from == "user_custom" then
-            if source.fname and file_exists(source.fname) then
-                os.remove(source.fname)
-            end
             DANMAKU.sources[url] = nil
         end
     end
@@ -312,7 +340,7 @@ local function clear_source()
     msg.verbose("已重置当前视频所有弹幕源更改")
 end
 
-function write_history(episodeid)
+function write_history(episodeid, api_server)
     local history = {}
     local path = mp.get_property("path")
     local dir = get_parent_directory(path)
@@ -352,6 +380,9 @@ function write_history(episodeid)
             history[dir].episodeId = episodeid
         elseif DANMAKU.extra then
             history[dir].extra = DANMAKU.extra
+        end
+        if api_server then
+            history[dir].api_server = api_server
         end
         write_json_file(HISTORY_PATH, history)
     end
@@ -426,6 +457,7 @@ function read_danmaku_source_record(path)
 
     local history = utils.parse_json(history_json) or {}
     local record = history[path]
+
     if not record or not record.sources then return end
 
     local sources = record.sources
@@ -496,39 +528,8 @@ function read_danmaku_source_record(path)
     end
 end
 
--- 收集现有的弹幕文件和延迟记录
-local function collect_danmaku_sources()
-    local danmaku_input = {}
-    local delays = {}
-
-    for _, source in pairs(DANMAKU.sources) do
-        if not source.blocked and source.fname then
-            if not file_exists(source.fname) then
-                show_message("未找到弹幕文件", 3)
-                msg.info("未找到弹幕文件")
-                return
-            end
-            table.insert(danmaku_input, source.fname)
-
-            if source.delay_segments and #source.delay_segments > 0 then
-                table.insert(delays, source.delay_segments)
-            end
-        end
-    end
-
-    return danmaku_input, delays
-end
-
 -- 视频播放时保存弹幕
 function save_danmaku(not_forced)
-    local danmaku_input, delays = collect_danmaku_sources()
-    if #danmaku_input == 0 then
-        show_message("弹幕内容为空，无法保存", 3)
-        msg.verbose("弹幕内容为空，无法保存")
-        COMMENTS = {}
-        return
-    end
-
     local path = mp.get_property("path")
     local dir = get_parent_directory(path) or ""
     local filename = mp.get_property('filename/no-ext')
@@ -544,7 +545,7 @@ function save_danmaku(not_forced)
             msg.info("已存在同名弹幕文件：" .. danmaku_out)
             return
         else
-            convert_danmaku_to_xml(danmaku_input, danmaku_out, delays)
+            convert_danmaku_to_xml(danmaku_out)
         end
     end
 end
@@ -552,19 +553,8 @@ end
 -- 加载弹幕
 function load_danmaku(from_menu, no_osd)
     if not ENABLED then return end
-    local temp_file = "danmaku-" .. PID .. ".ass"
-    local danmaku_file = utils.join_path(DANMAKU_PATH, temp_file)
-    local danmaku_input, delays = collect_danmaku_sources()
-    -- 如果没有弹幕文件，退出加载
-    if #danmaku_input == 0 then
-        show_message("该集弹幕内容为空，结束加载", 3)
-        msg.verbose("该集弹幕内容为空，结束加载")
-        COMMENTS = {}
-        return
-    end
-
-    convert_danmaku_format(danmaku_input, danmaku_file, delays)
-    parse_danmaku(danmaku_file, from_menu, no_osd)
+    convert_danmaku_to_ass_events()
+    render_danmaku(from_menu, no_osd)
 end
 
 -- 为 bilibli 网站的视频播放加载弹幕
@@ -620,8 +610,12 @@ function load_danmaku_for_bilibili(path)
             url,
         }
 
+        if options.cookie_file and options.cookie_file ~= "" then
+            table.insert(arg, '-b')
+            table.insert(arg, mp.command_native({"expand-path", options.cookie_file}))
+        end
+
         call_cmd_async(arg, function(error)
-            async_running = false
             if error then
                 show_message("HTTP 请求失败，打开控制台查看详情", 5)
                 msg.error(error)
@@ -673,8 +667,12 @@ function load_danmaku_for_bahamut(path)
         table.insert(arg, options.proxy)
     end
 
+    if options.cookie_file and options.cookie_file ~= "" then
+        table.insert(arg, '-b')
+        table.insert(arg, mp.command_native({"expand-path", options.cookie_file}))
+    end
+
     call_cmd_async(arg, function(error)
-        async_running = false
         if error then
             show_message("HTTP 请求失败，打开控制台查看详情", 5)
             msg.error(error)
@@ -688,30 +686,33 @@ function load_danmaku_for_bahamut(path)
         end
 
         local comments_json = read_file(danmaku_json)
+        os.remove(danmaku_json)
         local comments = utils.parse_json(comments_json)
         if not comments then
             return
         end
 
+        local output_table = {}
+        for _, comment in ipairs(comments) do
+            local color = hex_to_int_color(comment["color"])
+            local mode = get_type_from_position(comment["position"])
+            local time = tonumber(comment["time"]) / 10
+            local c_param = string.format("%s,%s,%s,25,,,", time, color, mode)
+            table.insert(output_table, {
+                c = c_param,
+                m = comment["text"]
+            })
+        end
+
+        local final_json_str = utils.format_json(output_table)
+
         temp_file = "danmaku-" .. PID .. DANMAKU.count .. ".json"
         local json_filename = utils.join_path(DANMAKU_PATH, temp_file)
         DANMAKU.count = DANMAKU.count + 1
+
         local json_file = io.open(json_filename, "w")
-
         if json_file then
-            json_file:write("[\n")
-            for _, comment in ipairs(comments) do
-                local m = comment["text"]
-                local color = hex_to_int_color(comment["color"])
-                local mode = get_type_from_position(comment["position"])
-                local time = tonumber(comment["time"]) / 10
-                local c = time .. "," .. color .. "," .. mode .. ",25,,,"
-
-                -- Write the JSON object as a single line, no spaces or extra formatting
-                local json_entry = string.format('{"c":"%s","m":"%s"},\n', c, m)
-                json_file:write(json_entry)
-            end
-            json_file:write("]")
+            json_file:write(final_json_str)
             json_file:close()
         end
 
@@ -769,6 +770,7 @@ function auto_load_danmaku(path, dir, filename, number)
                 local history_id = history_dir.episodeId
                 local history_fname = history_dir.fname
                 local history_extra = history_dir.extra
+                local history_api_server = history_dir.api_server
                 local playing_number = nil
 
                 if history_fname then
@@ -787,6 +789,7 @@ function auto_load_danmaku(path, dir, filename, number)
                 if playing_number ~= nil then
                     local x = playing_number - history_number --获取集数差值
                     DANMAKU.episode = episode_number and string.format("第%s话", episode_number + x) or history_dir.episodeTitle
+                    DANMAKU.api_server = history_api_server or nil
                     show_message("自动加载上次匹配的弹幕", 3)
                     msg.verbose("自动加载上次匹配的弹幕")
                     if history_id then
@@ -874,7 +877,7 @@ mp.register_event("file-loaded", function()
         return
     end
 
-    if ENABLED and COMMENTS == nil and not async_running then
+    if ENABLED and COMMENTS == nil and not is_async_running() then
         init(path)
     end
 end)
@@ -890,22 +893,28 @@ end)
 mp.register_script_message("danmaku-delay", function(...)
     local commands = {...}
     local delay_str, time_str = commands[1], commands[2]
-    local dly = tonumber(delay_str)
+    local source_arg = commands[3]
+    local dly = parse_delay_input(delay_str)
     local time = time_str and tonumber(time_str)
     if type(dly) ~= "number" then
         show_message("参数错误：缺少有效的延迟秒数", 3)
         return
     end
-    set_danmaku_delay(dly, time)
+    if source_arg and source_arg ~= "nil" then
+        set_danmaku_delay(dly, time, source_arg)
+    else
+        set_danmaku_delay(dly, time)
+    end
 end)
 
 mp.register_script_message("show_danmaku_keyboard", function()
     ENABLED = not ENABLED
     if ENABLED then
-        mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "on")
-        set_danmaku_visibility(true)
+        toggle_danmaku_switch("on")
+
         if COMMENTS == nil then
             show_message("加载弹幕初始化...", 3)
+            set_danmaku_visibility(true)
             local path = mp.get_property("path")
             init(path)
         else
@@ -914,8 +923,7 @@ mp.register_script_message("show_danmaku_keyboard", function()
         end
     else
         show_message("关闭弹幕", 2)
-        mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "off")
-        set_danmaku_visibility(false)
+        toggle_danmaku_switch("off")
         hide_danmaku_func()
     end
 end)
@@ -923,7 +931,7 @@ end)
 mp.register_script_message("check-update", check_for_update)
 mp.register_script_message("clear-source", clear_source)
 mp.register_script_message("immediately_save_danmaku", save_danmaku)
-mp.register_script_message("open_source_delay_menu", danmaku_delay_setup)
+mp.register_script_message("open_source_delay_menu", open_delay_menu)
 mp.register_script_message("open_search_danmaku_menu", open_input_menu)
 mp.register_script_message("open_add_source_menu", open_add_menu)
 mp.register_script_message("open_add_total_menu", open_add_total_menu)

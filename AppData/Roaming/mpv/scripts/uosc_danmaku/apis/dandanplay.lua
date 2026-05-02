@@ -21,65 +21,56 @@ end
 
 -- 写入history.json
 -- 读取episodeId获取danmaku
-function set_episode_id(input, from_menu)
+function set_episode_id(input, from_menu, api_server)
     from_menu = from_menu or false
     DANMAKU.source = "dandanplay"
+    local selected_server = api_server
     for url, source in pairs(DANMAKU.sources) do
         if source.from == "api_server" then
-            if source.fname and file_exists(source.fname) then
-                os.remove(source.fname)
-            end
-
             if not source.from_history then
                 DANMAKU.sources[url] = nil
             else
-                DANMAKU.sources[url]["fname"] = nil
+                DANMAKU.sources[url]["data"] = nil
             end
         end
     end
-    local episodeId = tonumber(input)
-    write_history(episodeId)
-    set_danmaku_button()
-    if options.load_more_danmaku then
-        fetch_danmaku_all(episodeId, from_menu)
-    else
-        fetch_danmaku(episodeId, from_menu)
+
+    if not api_server then
+        if DANMAKU.api_server ~= nil then
+            selected_server = DANMAKU.api_server
+        else
+            local servers = get_api_server_list(options.api_server)
+            if servers and #servers > 0 then
+                selected_server = servers[1]
+            end
+        end
     end
+
+    DANMAKU.api_server = selected_server
+
+    local episodeId = tonumber(input)
+    write_history(episodeId, selected_server)
+    set_danmaku_button()
+    fetch_danmaku(episodeId, from_menu, selected_server)
 end
 
 -- 回退使用额外的弹幕获取方式
 function get_danmaku_fallback(query)
-    local url = options.fallback_server .. "/?url=" .. query
+    local url = options.fallback_server .. "/?ac=dm&url=" .. query
     msg.verbose("尝试获取弹幕：" .. url)
-    local temp_file = "danmaku-" .. PID .. DANMAKU.count .. ".xml"
-    local danmaku_xml = utils.join_path(DANMAKU_PATH, temp_file)
-    DANMAKU.count = DANMAKU.count + 1
-    local arg = {
-        "curl",
-        "-L",
-        "-s",
-        "--compressed",
-        "--user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-        "--output",
-        danmaku_xml,
-        url,
-    }
 
-    call_cmd_async(arg, function(error)
-        async_running = false
-        if error then
-            show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            msg.error(error)
+    local args = make_danmaku_request_args("GET", url)
+    if not args then return end
+
+    fetch_danmaku_data(args, function(data)
+        if not data or not data["comments"] or data["count"] <= 1 then
+            msg.info("备用服务器无数据或返回格式不正确")
+            show_message("备用服务器无数据或返回格式不正确", 3)
             return
         end
-        if file_exists(danmaku_xml) then
-            if query:find("iqiyi%.com") ~= nil then
-                DANMAKU.strict = true
-            end
-            save_danmaku_downloaded(query, danmaku_xml)
-            load_danmaku(true)
-        end
+
+        save_danmaku_data(data["comments"], query, "user_custom")
+        load_danmaku(true)
     end)
 end
 
@@ -122,14 +113,58 @@ function make_danmaku_request_args(method, url, headers, body)
         table.insert(args, string.format('X-Timestamp: %s', time))
     end
 
+    if options.proxy ~= "" then
+        table.insert(args, '-x')
+        table.insert(args, options.proxy)
+    end
+
     table.insert(args, url)
 
     return args
 end
 
+local function normalize_danmaku_response(d)
+    if not d then return d end
+    -- 已经是 comments/count 格式则直接返回
+    if d.comments or d.count then return d end
+
+    if d.danmuku and type(d.danmuku) == "table" then
+        local out = {}
+        for _, item in ipairs(d.danmuku) do
+            -- item 预期为数组，索引: 1=time, 2=pos(right/top/bottom), 3=color(hex), 5=content
+            local time = tonumber(item[1]) or 0
+            local pos = item[2] or "right"
+            local color = item[3] or ""
+            local content = item[5] or item[4] or ""
+
+            local mode = 1
+            if pos == "right" then
+                mode = 1
+            elseif pos == "top" then
+                mode = 4
+            elseif pos == "bottom" then
+                mode = 5
+            end
+
+            local colorDec = 16777215
+            if type(color) == "number" then
+                colorDec = color
+            elseif type(color) == "string" then
+                colorDec = hex_to_int_color(color)
+            end
+
+            local p = string.format("%.2f,%d,%d", time, mode, colorDec)
+            table.insert(out, { p = p, m = content })
+        end
+        return { comments = out, count = tonumber(d.danum) or #out }
+    end
+
+    return d
+end
+
 -- 尝试通过解析文件名匹配剧集
-local function match_episode(animeTitle, bangumiId, episode_num)
-    local url = options.api_server .. "/api/v2/bangumi/" .. bangumiId
+local function match_episode(animeTitle, bangumiId, episode_num, api_server)
+    local url = api_server .. "/api/v2/bangumi/" .. bangumiId
     local args = make_danmaku_request_args("GET", url)
 
     if args == nil then
@@ -137,7 +172,6 @@ local function match_episode(animeTitle, bangumiId, episode_num)
     end
 
     call_cmd_async(args, function(error, json)
-        async_running = false
         if error then
             show_message("HTTP 请求失败，打开控制台查看详情", 5)
             msg.error(error)
@@ -151,10 +185,11 @@ local function match_episode(animeTitle, bangumiId, episode_num)
         end
 
         for _, episode in ipairs(data.bangumi.episodes) do
-            if tonumber(episode.episodeNumber) == tonumber(episode_num) then
+            local ep_num = tonumber(episode.episodeNumber)
+            if ep_num and ep_num == tonumber(episode_num) then
                 DANMAKU.anime = animeTitle
                 DANMAKU.episode = episode.episodeTitle
-                set_episode_id(episode.episodeId)
+                set_episode_id(episode.episodeId, nil, api_server)
                 break
             end
         end
@@ -162,9 +197,7 @@ local function match_episode(animeTitle, bangumiId, episode_num)
 end
 
 local function match_anime()
-    local animes = {}
     local anime_type = "tvseries"
-    local type_count = 0
     local title, season_num, episode_num = parse_title()
     if not episode_num then
         msg.info("无法解析剧集信息")
@@ -175,42 +208,81 @@ local function match_anime()
         anime_type = "ova"
     end
 
+    -- 并发在多个 api_server 上搜索，遇到第一个可接受的匹配就取消其余请求
     local encoded_query = url_encode(title)
-    local url = options.api_server .. "/api/v2/search/anime"
-    local params = "keyword=" .. encoded_query
-    local full_url = url .. "?" .. params
-    local args = make_danmaku_request_args("GET", full_url)
+    local servers = get_api_server_list(options.api_server)
 
-    if args == nil then
-        return
+    local matched = false
+    local cancel_fn = nil
+
+    local function build_args(server)
+        local url = server .. "/api/v2/search/anime"
+        local full_url = url .. "?keyword=" .. encoded_query
+        return make_danmaku_request_args("GET", full_url)
     end
 
-    call_cmd_async(args, function(error, json)
-        async_running = false
-        if error then
-            show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            msg.error(error)
+    local function per_response(server, err, out)
+        if matched then return end
+        if err then
+            msg.debug(("search anime failed for %s: %s"):format(server, tostring(err)))
             return
         end
-
-        local data = utils.parse_json(json)
+        local data = utils.parse_json(out)
         if not data or not data.animes then
-            msg.info("无结果")
             return
         end
-
+        local local_candidates = {}
         for _, anime in ipairs(data.animes) do
             if anime.type == anime_type then
-                type_count = type_count + 1
-                table.insert(animes, anime)
+                table.insert(local_candidates, anime)
             end
         end
-        if type_count == 1 then
-            match_episode(animes[1].animeTitle, animes[1].bangumiId, episode_num)
-        else
-            msg.info("匹配到多个结果，请尝试手动搜索")
+        if #local_candidates == 1 then
+            matched = true
+            local a = local_candidates[1]
+            match_episode(a.animeTitle, a.bangumiId, episode_num, server)
+            if cancel_fn then pcall(cancel_fn) end
+            return
         end
-    end)
+        if #local_candidates > 1 and season_num then
+            local best_match, best_score = nil, -1
+            local target_title = title
+            if tonumber(season_num) > 1 then
+                target_title = title .. " 第" .. number_to_chinese(season_num) .. "季"
+            end
+            for _, anime in ipairs(local_candidates) do
+                local animeTitle = tostring(anime.animeTitle or "")
+                animeTitle = animeTitle:gsub("^%s*(.-)%s*$", "%1")
+                            :gsub("%s*%(.-%)%s*$", "")
+                            :gsub("%s*【.-】.*$", "")
+                if animeTitle:match("第一[季部]") and tonumber(season_num) == 1 then
+                    target_title = title .. " 第一季"
+                end
+                local score = jaro_winkler(target_title, animeTitle)
+                msg.debug(("候选: %s -> 相似度 %.3f"):format(animeTitle, score))
+                if score > best_score then
+                    best_score = score
+                    best_match = anime
+                end
+            end
+            if best_match and best_score >= 0.75 then
+                matched = true
+                msg.info(("模糊匹配选中: %s (score=%.2f)"):format(best_match.animeTitle, best_score))
+                match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, server)
+                if cancel_fn then pcall(cancel_fn) end
+                return
+            end
+        end
+        -- 未找到可接受匹配，继续等待其他服务器的返回
+    end
+
+    local function final_cb()
+        if not matched then
+            msg.info("没有找到合适的匹配结果")
+        end
+    end
+
+    cancel_fn = parallel_requests(servers, build_args, per_response, final_cb, { concurrency = 5, per_request_timeout = 15 })
 end
 
 -- 执行哈希匹配获取弹幕
@@ -247,195 +319,83 @@ local function match_file(file_path, file_name, callback)
         file_name = title
     end
 
-    local url = options.api_server .. "/api/v2/match"
-    local args = make_danmaku_request_args("POST", url, {
-            ["Content-Type"] = "application/json"
-        }, {
-            fileName = file_name,
-            fileHash = hash or "",
-            matchMode = "hashAndFileName"
-        }
-    )
+    local servers = get_api_server_list(options.api_server)
 
-    if args == nil then
-        return
+    local matched = false
+    local cancel_fn = nil
+
+    local function build_args(server)
+        local url = server .. "/api/v2/match"
+        return make_danmaku_request_args("POST", url, { ["Content-Type"] = "application/json" }, {
+            fileName = file_name,
+            fileHash = hash or "a1b2c3d4e5f67890abcd1234ef567890",
+            matchMode = "hashAndFileName"
+        })
     end
 
-    call_cmd_async(args, function(error, json)
-        async_running = false
-        if error then
-            show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            callback(error)
+    local function per_response(server, err, out)
+        if matched then return end
+        if err then
+            msg.debug(("match failed for %s: %s"):format(server, tostring(err)))
             return
         end
-        local data = utils.parse_json(json)
-        if not data or not data.isMatched or #data.matches > 1 then
-            callback("没有匹配的剧集")
+        local data = utils.parse_json(out)
+        if not data or not data.isMatched then
             return
         end
-
+        matched = true
         DANMAKU.anime = data.matches[1].animeTitle
         DANMAKU.episode = data.matches[1].episodeTitle
 
-        -- 获取并加载弹幕数据
-        set_episode_id(data.matches[1].episodeId)
-    end)
+        set_episode_id(data.matches[1].episodeId, nil, server)
+        if cancel_fn then pcall(cancel_fn) end
+        if callback then pcall(callback) end
+    end
+
+    local function final_cb()
+        if not matched then
+            callback("没有匹配的剧集")
+        end
+    end
+
+    cancel_fn = parallel_requests(servers, build_args, per_response, final_cb, { concurrency = 5, per_request_timeout = 15 })
 end
 
 -- 异步获取弹幕数据
 function fetch_danmaku_data(args, callback)
     call_cmd_async(args, function(error, json)
-        async_running = false
         if error then
             show_message("获取数据失败", 3)
             msg.error("HTTP 请求失败：" .. error)
             return
         end
         local data = utils.parse_json(json)
+        data = normalize_danmaku_response(data)
         callback(data)
     end)
 end
 
 -- 保存弹幕数据
 function save_danmaku_data(comments, query, danmaku_source)
-    local temp_file = "danmaku-" .. PID .. DANMAKU.count .. ".json"
-    local danmaku_file = utils.join_path(DANMAKU_PATH, temp_file)
-    DANMAKU.count = DANMAKU.count + 1
-    local success = save_danmaku_json(comments, danmaku_file)
+    local danmaku_list = save_danmaku_to_list(comments)
 
-    if success then
-        if DANMAKU.sources[query] ~= nil then
-            if DANMAKU.sources[query].fname and file_exists(DANMAKU.sources[query].fname) then
-                os.remove(DANMAKU.sources[query].fname)
-            end
-            DANMAKU.sources[query]["fname"] = danmaku_file
-        else
-            DANMAKU.sources[query] = {from = danmaku_source, fname = danmaku_file}
-        end
+    if DANMAKU.sources[query] ~= nil then
+        DANMAKU.sources[query]["data"] = danmaku_list
+    else
+        DANMAKU.sources[query] = {from = danmaku_source, data = danmaku_list}
     end
 end
 
 function save_danmaku_downloaded(url, downloaded_file)
+    local danmaku_list = parse_danmaku_file(downloaded_file)
+    if file_exists(downloaded_file) then
+        os.remove(downloaded_file)
+    end
     if DANMAKU.sources[url] ~= nil then
-        if DANMAKU.sources[url].fname and file_exists(DANMAKU.sources[url].fname) then
-            os.remove(DANMAKU.sources[url].fname)
-        end
-        DANMAKU.sources[url]["fname"] = downloaded_file
+        DANMAKU.sources[url]["data"] = danmaku_list
     else
-        DANMAKU.sources[url] = {from = "user_custom", fname = downloaded_file}
+        DANMAKU.sources[url] = {from = "user_custom", data = danmaku_list}
     end
-end
-
--- 处理弹幕数据
-function handle_danmaku_data(query, data, from_menu)
-    local comments = data["comments"]
-    local count = data["count"]
-
-    -- 如果没有数据，进行重试
-    if count == 0 then
-        show_message("服务器无缓存数据，再次尝试请求", 30)
-        msg.verbose("服务器无缓存数据，再次尝试请求")
-        -- 等待 2 秒后重试
-        local start = os.time()
-        while os.time() - start < 2 do
-            -- 空循环，等待 2 秒
-        end
-        -- 重新发起请求
-        local url = options.api_server .. "/api/v2/extcomment?url=" .. url_encode(query)
-        local args = make_danmaku_request_args("GET", url)
-
-        if args == nil then
-            return
-        end
-
-        fetch_danmaku_data(args, function(retry_data)
-            if not retry_data or not retry_data["comments"] or retry_data["count"] == 0 then
-                get_danmaku_fallback(query)
-                return
-            end
-            save_danmaku_data(retry_data["comments"], query, "user_custom")
-            load_danmaku(from_menu)
-        end)
-    else
-        save_danmaku_data(comments, query, "user_custom")
-        load_danmaku(from_menu)
-    end
-end
-
--- 处理第三方弹幕数据
-function handle_related_danmaku(index, relateds, related, shift, callback)
-    local url = options.api_server .. "/api/v2/extcomment?url=" .. url_encode(related["url"])
-    show_message(string.format("正在从第三方库装填弹幕 [%d/%d]", index, #relateds), 30)
-    msg.verbose("正在从第三方库装填弹幕：" .. url)
-
-    local args = make_danmaku_request_args("GET", url)
-
-    if args == nil then
-        return
-    end
-
-    fetch_danmaku_data(args, function(data)
-        local comments = {}
-        if data and data["comments"] then
-            if data["count"] == 0 then
-                -- 如果没有数据，稍等 2 秒重试
-                local start = os.time()
-                while os.time() - start < 2 do
-                    -- 空循环，等待 2 秒
-                end
-                fetch_danmaku_data(args, function(data)
-                    for _, comment in ipairs(data["comments"]) do
-                        comment["shift"] = shift
-                        table.insert(comments, comment)
-                    end
-                    callback(comments)
-                end)
-            else
-                for _, comment in ipairs(data["comments"]) do
-                    comment["shift"] = shift
-                    table.insert(comments, comment)
-                end
-                callback(comments)
-            end
-        else
-            show_message("无数据", 3)
-            msg.info("无数据")
-            callback(comments)
-        end
-    end)
-end
-
--- 处理dandan库的弹幕数据
-function handle_main_danmaku(url, from_menu)
-    show_message("正在从弹弹Play库装填弹幕", 30)
-    msg.verbose("尝试获取弹幕：" .. url)
-    local args = make_danmaku_request_args("GET", url)
-
-    if args == nil then
-        return
-    end
-
-    fetch_danmaku_data(args, function(data)
-        if not data or not data["comments"] then
-            show_message("无数据", 3)
-            msg.info("无数据")
-            return
-        end
-
-        local comments = data["comments"]
-        local count = data["count"]
-
-        if count == 0 then
-            if DANMAKU.sources[url] == nil then
-                DANMAKU.sources[url] = {from = "api_server"}
-            end
-            load_danmaku(from_menu)
-            return
-        end
-
-        save_danmaku_data(comments, url, "api_server")
-        load_danmaku(from_menu)
-    end)
 end
 
 -- 处理获取到的数据
@@ -459,8 +419,8 @@ end
 
 -- 匹配弹幕库 comment, 仅匹配dandan本身弹幕库
 -- 通过danmaku api（url）+id获取弹幕
-function fetch_danmaku(episodeId, from_menu)
-    local url = options.api_server .. "/api/v2/comment/" .. episodeId .. "?withRelated=true&chConvert=0"
+function fetch_danmaku(episodeId, from_menu, api_server)
+    local url = api_server .. "/api/v2/comment/" .. episodeId .. "?withRelated=true&chConvert=0"
     show_message("弹幕加载中...", 30)
     msg.verbose("尝试获取弹幕：" .. url)
     local args = make_danmaku_request_args("GET", url)
@@ -471,57 +431,6 @@ function fetch_danmaku(episodeId, from_menu)
 
     fetch_danmaku_data(args, function(data)
         handle_fetched_danmaku(data, url, from_menu)
-    end)
-end
-
--- 主函数：获取所有相关弹幕
-function fetch_danmaku_all(episodeId, from_menu)
-    local url = options.api_server .. "/api/v2/related/" .. episodeId
-    show_message("弹幕加载中...", 30)
-    msg.verbose("尝试获取弹幕：" .. url)
-    local args = make_danmaku_request_args("GET", url)
-
-    if args == nil then
-        return
-    end
-
-    fetch_danmaku_data(args, function(data)
-        if not data or not data["relateds"] then
-            show_message("无数据", 3)
-            msg.info("无数据")
-            return
-        end
-
-        -- 处理所有的相关弹幕
-        local relateds = data["relateds"]
-        local function process_related(index)
-            if index > #relateds then
-                -- 所有相关弹幕加载完成后，开始加载主库弹幕
-                url = options.api_server .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
-                handle_main_danmaku(url, from_menu)
-                return
-            end
-
-            local related = relateds[index]
-            local shift = related["shift"]
-
-            -- 处理当前的相关弹幕
-            handle_related_danmaku(index, relateds, related, shift, function(comments)
-                if #comments == 0 then
-                    if DANMAKU.sources[related["url"]] == nil then
-                        DANMAKU.sources[related["url"]] = {from = "api_server"}
-                    end
-                else
-                    save_danmaku_data(comments, related["url"], "api_server")
-                end
-
-                -- 继续处理下一个相关弹幕
-                process_related(index + 1)
-            end)
-        end
-
-        -- 从第一个相关库开始请求
-        process_related(1)
     end)
 end
 
@@ -565,19 +474,16 @@ function add_danmaku_source_local(query, from_menu)
         msg.warn("无效的文件路径")
         return
     end
-    if not (string.match(path, "%.xml$") or string.match(path, "%.json$") or string.match(path, "%.ass$")) then
+    if not (string.match(path, "%.xml$") or string.match(path, "%.json$")) then
         msg.warn("仅支持弹幕文件")
         return
     end
 
     if DANMAKU.sources[query] ~= nil then
-        if DANMAKU.sources[query].fname and file_exists(DANMAKU.sources[query].fname) then
-            os.remove(DANMAKU.sources[query].fname)
-        end
         DANMAKU.sources[query]["from"] = "user_local"
-        DANMAKU.sources[query]["fname"] = path
+        DANMAKU.sources[query]["data"] = parse_danmaku_file(path)
     else
-        DANMAKU.sources[query] = {from = "user_local", fname = path}
+        DANMAKU.sources[query] = {from = "user_local", data = parse_danmaku_file(path)}
     end
 
     set_danmaku_button()
@@ -587,63 +493,93 @@ end
 --通过输入源url获取弹幕库
 function add_danmaku_source_online(query, from_menu)
     set_danmaku_button()
-    local url = options.api_server .. "/api/v2/extcomment?url=" .. url_encode(query)
     show_message("弹幕加载中...", 30)
-    msg.verbose("尝试获取弹幕：" .. url)
-    local args = make_danmaku_request_args("GET", url)
+    msg.verbose("尝试获取弹幕：" .. query)
 
-    if args == nil then
+    local servers = get_api_server_list(options.api_server)
+
+    -- 过滤掉指向 dandanplay.net 的服务器
+    local filtered = {}
+    for _, s in ipairs(servers) do
+        if type(s) == "string" and not s:lower():find("dandanplay%.net") then
+            table.insert(filtered, s)
+        end
+    end
+    servers = filtered
+    if #servers == 0 then
+        get_danmaku_fallback(query)
         return
     end
 
-    fetch_danmaku_data(args, function(data)
-        if not data or not data["comments"] then
-            show_message("此源弹幕无法加载", 3)
-            msg.verbose("此源弹幕无法加载")
-            return
-        end
-        handle_danmaku_data(query, data, from_menu)
-    end)
-end
+    local matched = false
+    local cancel_fn = nil
 
--- 将弹幕转换为factory可读的json格式
-function save_danmaku_json(comments, json_filename)
-    local temp_file = "danmaku-" .. PID .. ".json"
-    json_filename = json_filename or utils.join_path(DANMAKU_PATH, temp_file)
-    local json_file = io.open(json_filename, "w")
-
-    if json_file then
-        json_file:write("[\n")
-        for _, comment in ipairs(comments) do
-            local p = comment["p"]
-            local shift = comment["shift"]
-            if p then
-                local fields = split(p, ",")
-                if shift ~= nil then
-                    fields[1] = tonumber(fields[1]) + tonumber(shift)
-                end
-                local c_value = string.format(
-                    "%s,%s,%s,25,,,",
-                    tostring(fields[1]), -- first field of p to first field of c
-                    fields[3], -- third field of p to second field of c
-                    fields[2]  -- second field of p to third field of c
-                )
-                local m_value = comment["m"]
-                                :gsub("[%z\1-\31]", "")
-                                :gsub("\\", "")
-                                :gsub("\"", "")
-
-                -- Write the JSON object as a single line, no spaces or extra formatting
-                local json_entry = string.format('{"c":"%s","m":"%s"},\n', c_value, m_value)
-                json_file:write(json_entry)
-            end
-        end
-        json_file:write("]")
-        json_file:close()
-        return true
+    local function build_args(server)
+        local url = server .. "/api/v2/extcomment?url=" .. url_encode(query)
+        return make_danmaku_request_args("GET", url)
     end
 
-    return false
+    local function per_response(server, err, out)
+        if matched then return end
+        if err then
+            msg.debug(("extcomment failed for %s: %s"):format(server, tostring(err)))
+            return
+        end
+        local data = utils.parse_json(out)
+        data = normalize_danmaku_response(data)
+        if not data or not data["comments"] or data["count"] <= 1 then
+            return
+        end
+        matched = true
+        -- 保存并加载弹幕
+        save_danmaku_data(data["comments"], query, "user_custom")
+        load_danmaku(from_menu)
+        -- 取消其他未完成请求
+        if cancel_fn then pcall(cancel_fn) end
+    end
+
+    local function final_cb()
+        if not matched then
+            -- 所有服务器都未返回有效弹幕，回退到备用服务器
+            msg.info("所有服务器均无有效弹幕，尝试备用服务器")
+            get_danmaku_fallback(query)
+        end
+    end
+
+    cancel_fn = parallel_requests(servers, build_args, per_response, final_cb, { concurrency = 3, per_request_timeout = 30 })
+end
+
+-- 将弹幕转换为 Lua table
+function save_danmaku_to_list(comments)
+    local danmaku_list = {}
+
+    for _, comment in ipairs(comments) do
+        local p = comment["p"]
+        local shift = comment["shift"]
+        if p then
+            local fields = split(p, ",")
+            if shift ~= nil then
+                fields[1] = tonumber(fields[1]) + tonumber(shift)
+            end
+            local time = tonumber(fields[1])
+            local type = tonumber(fields[2])
+            local color = tonumber(fields[3]) or 0xFFFFFF
+            local size = 25
+            local m_value = comment["m"]
+                            :gsub("[%z\1-\31]", "")
+                            :gsub("\\", "")
+                            :gsub("\"", "")
+            table.insert(danmaku_list, {
+                time = time,
+                type = type,
+                size = size,
+                color = color,
+                text = m_value
+            })
+        end
+    end
+
+    return danmaku_list
 end
 
 -- 通过文件前 16M 的 hash 值进行弹幕匹配
@@ -678,8 +614,6 @@ function get_danmaku_with_hash(file_name, file_path)
         end
 
         call_cmd_async(arg, function(error)
-            async_running = false
-
             file_path = utils.join_path(DANMAKU_PATH, temp_file)
 
             match_file(file_path, file_name, function(error)
